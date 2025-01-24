@@ -164,12 +164,11 @@ struct OnvifSession {
     int discovery_msg_id;
     char preferred_network_address[16];
     char active_network_interfaces[16][1024];
-    char primary_network_interface[1024];
 };
 
 LIBRARY_API void initializeSession(struct OnvifSession *onvif_session);
 LIBRARY_API void closeSession(struct OnvifSession *onvif_session);
-LIBRARY_API int broadcast(struct OnvifSession *onvif_session);
+LIBRARY_API int broadcast(struct OnvifSession *onvif_session, int timeout_sec);
 LIBRARY_API bool prepareOnvifData(int ordinal, struct OnvifSession *onvif_session, struct OnvifData *onvif_data);
 LIBRARY_API int fillRTSPn(struct OnvifData *onvif_data, int profileIndex);
 #define fillRTSP(a) fillRTSPn(a,0)
@@ -235,7 +234,7 @@ LIBRARY_API bool extractXAddrs(int ordinal, struct OnvifSession *onvif_session, 
 LIBRARY_API void extractOnvifService(char service[1024], bool post);
 LIBRARY_API void extractHost(char * xaddrs, char host[128]);
 
-LIBRARY_API int setSocketOptions(int socket);
+LIBRARY_API int setSocketOptions(int socket, int timeout_sec);
 LIBRARY_API void prefix2mask(int prefix, char mask_buf[128]);
 LIBRARY_API int mask2prefix(char * mask_buf);
 LIBRARY_API void getIPAddress(char buf[128]);

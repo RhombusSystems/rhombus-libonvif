@@ -40,11 +40,12 @@ int longopt = 0;
 static struct option longopts[] = {
              { "user",       required_argument, NULL,      'u'},
              { "password",   required_argument, NULL,      'p'},
-             { "all",        no_argument,       NULL,      'a'},
+             { "all",        required_argument, NULL,      'a'},
 			 { "safe_off",   no_argument,       NULL,      's'},
              { "help",       required_argument, NULL,      'h'},
 			 { "version",    no_argument,       NULL,      'v'},
 			 { "time_sync",  no_argument,       NULL,      't'},
+			 { "direct",     no_argument,       NULL,      'd'},
              { NULL,         0,                 NULL,       0 }
      };
 
@@ -53,10 +54,10 @@ static const char *password = nullptr;
 
 static void usage()
 {
-	std::cout << "Usage: onvif-util [-ahsv] [-u <user>] [-p <password>] [command]" << std::endl;
+	std::cout << "Usage: onvif-util [-hsvd] [-a <timeout_sec>] [-u <user>] [-p <password>] [command]" << std::endl;
 }
 
-static void showAll()
+static void showAll(int timeout_sec)
 {
 	struct OnvifSession *onvif_session = (struct OnvifSession*)calloc(sizeof(struct OnvifSession), 1);
     struct OnvifData *onvif_data = (struct OnvifData*)calloc(sizeof(struct OnvifData), 1);
@@ -65,6 +66,10 @@ static void showAll()
 	getActiveNetworkInterfaces(onvif_session);
 	int index = 0;
 
+    if (timeout_sec <= 0) {
+        timeout_sec = 1;
+    }
+
 	while (true) {
 		char * element = onvif_session->active_network_interfaces[index];
 		if (strlen(element)) {
@@ -72,7 +77,7 @@ static void showAll()
 			memset(onvif_session->preferred_network_address, 0, sizeof(onvif_session->preferred_network_address));
 			strcpy(onvif_session->preferred_network_address, ip_address);
 			
-			int n = broadcast(onvif_session);
+			int n = broadcast(onvif_session, timeout_sec);
 			std::cout << "Found " << n << " cameras on interface " << ip_address << std::endl;
 			for (int i = 0; i < n; i++) {
 				if (prepareOnvifData(i, onvif_session, onvif_data)) {
@@ -105,14 +110,15 @@ static void showAll()
 static void showHelp()
 {
 	std::cout << "\n  onvif-util help\n\n"
-			  << "  Usage: onvif-util [-ahs] [-u <user>] [-p <password>] [command]\n\n"
+			  << "  Usage: onvif-util [-hs] [-a timeout_sec] [-u <user>] [-p <password>] [command]\n\n"
 			  << "    options\n"
-			  << "      -a  poll all cameras on network and reply with host name\n"
+			  << "      -a  timeout_sec poll all cameras on network and reply with host name\n"
 			  << "      -u  username\n"
 			  << "      -p  password\n"
 			  << "      -s  safe mode off, enable applications for viewer and browser to run\n\n"
+			  << "      -d  direct mode, don't attempt broadcast\n\n"
 			  << "  To view all cameras on the network:\n"
-			  << "  onvif-util -a\n\n"
+			  << "  onvif-util -a 5\n\n"
 			  << "  To login to a particular camera:\n"
 			  << "  onvif-util -u username -p password ip_address\n\n"
 			  << "  To login to a camera with safe mode disabled:\n"
@@ -217,9 +223,10 @@ int main(int argc, char **argv)
 {
 	bool safe_mode = true;
 	bool time_sync = false;
+    bool direct_mode = false;
 
 	int ch;
-	while ((ch = getopt_long(argc, argv, "u:p:ahsvt", longopts, NULL)) != -1) {
+	while ((ch = getopt_long(argc, argv, "u:p:a:hsvtd", longopts, NULL)) != -1) {
 		switch (ch) {
             case 'u':
 				username = optarg;
@@ -228,7 +235,7 @@ int main(int argc, char **argv)
 				password = optarg;
 				break;
 			case 'a':
-				showAll();
+				showAll(atoi(optarg));
 				exit(0);
 			case 'h':
 				usage();
@@ -243,6 +250,9 @@ int main(int argc, char **argv)
 			case 't':
 				time_sync = true;
 				break;
+            case 'd':
+                direct_mode = true;
+                break;
 			case 0:
 				std::cout << optarg << std::endl;
 				break;
@@ -271,67 +281,69 @@ int main(int argc, char **argv)
 	int index = 0;
 	bool found = false;
 
-	while (!found) {
-		char * element = onvif_session->active_network_interfaces[index];
-		if (strlen(element)) {
-			char * ip_address = strtok(element, " - ");
-			memset(onvif_session->preferred_network_address, 0, sizeof(onvif_session->preferred_network_address));
-			strcpy(onvif_session->preferred_network_address, ip_address);
+    if (!direct_mode) {
+        while (!found) {
+            char * element = onvif_session->active_network_interfaces[index];
+            if (strlen(element)) {
+                char * ip_address = strtok(element, " - ");
+                memset(onvif_session->preferred_network_address, 0, sizeof(onvif_session->preferred_network_address));
+                strcpy(onvif_session->preferred_network_address, ip_address);
 
-			int n = broadcast(onvif_session);
-			for (int i = 0; i < n; i++) {
-				bool success = prepareOnvifData(i, onvif_session, onvif_data);
-				if (!success) {
-					std::cout << "found invalid xaddrs in device response for device " << i << std::endl;
-					continue;
-				}
-				char host[128];
-				extractHost(onvif_data->xaddrs, host);
-				getHostname(onvif_data);
-				if (!strcmp(host, wanted)) {
-					std::cout << "  found host: " << host << std::endl;
-					found = true;
-					if (username) strcpy(onvif_data->username, username);
-					if (password) strcpy(onvif_data->password, password);
-					if (getDeviceInformation(onvif_data)  == 0) {
-						std::cout << "  successfully connected to host" << "\n";
-						std::cout << "    name:   " << onvif_data->camera_name << "\n";
-						std::cout << "    serial: " << onvif_data->serial_number << "\n" << std::endl;
-			
-						// Initializing the session properly with the camera requires calling getCapabilities
-						if (getCapabilities(onvif_data)) {
-							std::cout << "ERROR: get capabilities - " << onvif_data->last_error << "\n" << std::endl;
-							exit(1);
-						}
+                int n = broadcast(onvif_session, 1); // original behavior was a 500ms timeout so we'll just use 1s here
+                for (int i = 0; i < n; i++) {
+                    bool success = prepareOnvifData(i, onvif_session, onvif_data);
+                    if (!success) {
+                        std::cout << "found invalid xaddrs in device response for device " << i << std::endl;
+                        continue;
+                    }
+                    char host[128];
+                    extractHost(onvif_data->xaddrs, host);
+                    getHostname(onvif_data);
+                    if (!strcmp(host, wanted)) {
+                        std::cout << "  found host: " << host << std::endl;
+                        found = true;
+                        if (username) strcpy(onvif_data->username, username);
+                        if (password) strcpy(onvif_data->password, password);
+                        if (getDeviceInformation(onvif_data)  == 0) {
+                            std::cout << "  successfully connected to host" << "\n";
+                            std::cout << "    name:   " << onvif_data->camera_name << "\n";
+                            std::cout << "    serial: " << onvif_data->serial_number << "\n" << std::endl;
+                
+                            // Initializing the session properly with the camera requires calling getCapabilities
+                            if (getCapabilities(onvif_data)) {
+                                std::cout << "ERROR: get capabilities - " << onvif_data->last_error << "\n" << std::endl;
+                                exit(1);
+                            }
 
-						if (time_sync) {
-							std::cout << "  Time sync requested" << std::endl;
-							std::vector<std::string> tmp;
-							profileCheck(onvif_data, tmp);
-							if (setSystemDateAndTime(onvif_data)) throw std::runtime_error(cat("set system date and time - ", onvif_data->last_error));
-							std::cout << "  Camera date and time has been synchronized without regard to camera timezone\n" << std::endl;
-							exit(0);
-						}
-						break;
-					}
-					else {
-						std::cout << "ERROR: get device information - " << onvif_data->last_error << "\n" << std::endl;
-						exit(1);
-					}
-				}
-				if (i == n - 1) {
-					continue;
-				}
-			}
+                            if (time_sync) {
+                                std::cout << "  Time sync requested" << std::endl;
+                                std::vector<std::string> tmp;
+                                profileCheck(onvif_data, tmp);
+                                if (setSystemDateAndTime(onvif_data)) throw std::runtime_error(cat("set system date and time - ", onvif_data->last_error));
+                                std::cout << "  Camera date and time has been synchronized without regard to camera timezone\n" << std::endl;
+                                exit(0);
+                            }
+                            break;
+                        }
+                        else {
+                            std::cout << "ERROR: get device information - " << onvif_data->last_error << "\n" << std::endl;
+                            exit(1);
+                        }
+                    }
+                    if (i == n - 1) {
+                        continue;
+                    }
+                }
 
-			index++;
-			if (index > 16)
-				continue;
-		}
-		else {
-			break;
-		}
-	}
+                index++;
+                if (index > 16)
+                    continue;
+            }
+            else {
+                break;
+            }
+        }
+    }
 
 	if (!found) {
 		std::stringstream xaddrs;
@@ -340,6 +352,16 @@ int main(int argc, char **argv)
 		if (password) strcpy(onvif_data->password, password);
 		strcpy(onvif_data->xaddrs, xaddrs.str().c_str());
 		strcpy(onvif_data->device_service, xaddrs.str().c_str());
+
+        /*
+         * [jsalcedo] 2024-11-27: direct mode skips broadcast attempt and just dumps all the
+         * info it can and exits
+         */
+        if (direct_mode) {
+            dumpConfigAll(onvif_data);
+            exit(0);
+        }
+
 		if (getCapabilities(onvif_data)) {
 			std::cout << "ERROR: get capabilities - " << onvif_data->last_error << "\n" << std::endl;
 			exit(1);
@@ -381,14 +403,8 @@ int main(int argc, char **argv)
 		std::string cmd(kybd_buf);
 	*/
 	/////////////////////////
-
-	std::string quit("quit");
-#ifdef _WIN32
-	quit = "quit\r";
-#endif
-
 	std::string cmd;
-	while (cmd != quit) {
+	while (cmd != "quit") {
 		std::cout << onvif_data->camera_name << "> ";
 		if (!std::getline(std::cin, cmd))
 			break;	
@@ -894,8 +910,7 @@ int main(int argc, char **argv)
 			else { 
 				//if (strcmp(kybd_buf, "quit"))
 				//	std::cout << " Unrecognized command, type help to see help\n" << std::endl;
-
-				if (cmd != quit)
+				if (cmd != "quit")
 					std::cout << " Unrecognized command \"" << args[0] << "\", type \"help\" to see help\n" << std::endl;
 			}
 		}

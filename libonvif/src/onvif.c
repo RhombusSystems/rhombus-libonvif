@@ -67,7 +67,8 @@ void getUUID(char uuid_buf[47]);
 void addUsernameDigestHeader(xmlNodePtr root, xmlNsPtr ns_env, char * user, char * password, time_t offset);
 void addHttpHeader(xmlDocPtr doc, xmlNodePtr root, char * xaddrs, char * post_type, char cmd[], int cmd_length);
 int checkForXmlErrorMsg(xmlDocPtr doc, char error_msg[1024]);
-int getXmlValue(xmlDocPtr doc, xmlChar *xpath, char buf[], int buf_length);
+int getXmlValueN(xmlDocPtr doc, xmlChar *xpath, char buf[], int buf_length, int profileIndex);
+#define getXmlValue(doc,xpath,buf,buf_length) getXmlValueN(doc,xpath,buf,buf_length, 0)
 int getNodeAttributen (xmlDocPtr doc, xmlChar *xpath, xmlChar *attribute, char buf[], int buf_length, int profileIndex);
 #define getNodeAttribute(doc,xpath,attribute,buf,buf_length) getNodeAttributen(doc,xpath,attribute,buf,buf_length,0)
 xmlXPathObjectPtr getNodeSet (xmlDocPtr doc, xmlChar *xpath);
@@ -77,6 +78,14 @@ const int SHA1_DIGEST_SIZE = 20;
 char preferred_network_address[16];
 static bool dump_reply = false;
 static void dumpReply(xmlDocPtr reply);
+
+#define MAX_PROFILE_COUNT   16
+struct ProfileTokenHolder {
+    char profileToken[MAX_PROFILE_COUNT][128];
+    char videoEncoding[MAX_PROFILE_COUNT][128];
+};
+
+static int saveProfileTokens(struct OnvifData * onvif_data, struct ProfileTokenHolder * tokenHolder);
 
 int getNetworkInterfaces(struct OnvifData *onvif_data) {
     memset(onvif_data->ip_address_buf, 0, sizeof(onvif_data->ip_address_buf));
@@ -1739,6 +1748,53 @@ int setSystemDateAndTimeUsingTimezone(struct OnvifData *onvif_data) {
     return result;
 }
 
+static int saveProfileTokens(struct OnvifData * onvif_data, struct ProfileTokenHolder * tokenHolder) {
+    int result = 0;
+    memset(tokenHolder, 0, sizeof(struct ProfileTokenHolder)); 
+    memset(onvif_data->last_error, 0, sizeof(onvif_data->last_error));
+
+    xmlDocPtr doc = xmlNewDoc(BAD_CAST "1.0");
+    xmlNodePtr root = xmlNewDocNode(doc, NULL, BAD_CAST "Envelope", NULL);
+    xmlDocSetRootElement(doc, root);
+    xmlNsPtr ns_env = xmlNewNs(root, BAD_CAST "http://www.w3.org/2003/05/soap-envelope", BAD_CAST "SOAP-ENV");
+    xmlNsPtr ns_trt = xmlNewNs(root, BAD_CAST "http://www.onvif.org/ver10/media/wsdl", BAD_CAST "trt");
+    xmlSetNs(root, ns_env);
+    addUsernameDigestHeader(root, ns_env, onvif_data->username, onvif_data->password, onvif_data->time_offset);
+    xmlNodePtr body = xmlNewTextChild(root, ns_env, BAD_CAST "Body", NULL);
+    xmlNewTextChild(body, ns_trt, BAD_CAST "GetProfiles", NULL);
+    char cmd[4096] = {0};
+    addHttpHeader(doc, root, onvif_data->xaddrs, onvif_data->media_service, cmd, 4096);
+    xmlDocPtr reply = sendCommandToCamera(cmd, onvif_data->xaddrs);
+    if (reply != NULL) {
+
+        int profileIndex = 0;
+        int getAttrRes;
+        while (profileIndex < MAX_PROFILE_COUNT) {
+            if (getNodeAttributen(reply, BAD_CAST "//s:Body//trt:GetProfilesResponse//trt:Profiles", BAD_CAST "token", tokenHolder->profileToken[profileIndex], 128, profileIndex)) {
+                break;
+            }
+            // also save the VideoEncoderConfiguration.Encoding if it exists
+            getXmlValueN(reply, BAD_CAST "//s:Body//trt:GetProfilesResponse//trt:Profiles//tt:VideoEncoderConfiguration//tt:Encoding", tokenHolder->videoEncoding[profileIndex], 128, profileIndex);
+            profileIndex++;
+        }
+
+        fprintf(stderr, "Saved %d profile tokens\n", profileIndex);
+        int i;
+        for (i = 0; i < profileIndex; i++) {
+            fprintf(stderr, "    Token %d: %s video encoding '%s'\n", i, tokenHolder->profileToken[i], tokenHolder->videoEncoding[i]);
+        }
+
+        result = checkForXmlErrorMsg(reply, onvif_data->last_error);
+        if (result < 0)
+            strcat(onvif_data->last_error, " getProfileToken");
+        xmlFreeDoc(reply);
+    } else {
+        result = -1;
+        strcpy(onvif_data->last_error, "getProfileToken - No XML reply");
+    }
+    return result;
+}
+
 int getProfileToken(struct OnvifData *onvif_data, int profileIndex) {
     int result = 0;
     //onvif_data->profileToken[0] = 0;
@@ -1989,6 +2045,7 @@ void getDiscoveryXml(char buffer[], int buf_size, char uuid[47]) {
     xmlNsPtr ns_p = xmlNewNs(probe, NULL, BAD_CAST "p");
     xmlSetNs(probe, ns_p);
     xmlNodePtr types = xmlNewTextChild(probe, NULL, BAD_CAST "Types", BAD_CAST "dp0:NetworkVideoTransmitter");
+    //xmlNodePtr types = xmlNewTextChild(probe, NULL, BAD_CAST "Types", BAD_CAST "dp0:Device");
     xmlNewProp(types, BAD_CAST "xmlns:d", BAD_CAST "http://schemas.xmlsoap.org/ws/2005/04/discovery");
     xmlNewProp(types, BAD_CAST "xmlns:dp0", BAD_CAST "http://www.onvif.org/ver10/network/wsdl");
     xmlNsPtr ns_d = xmlNewNs(types, NULL, BAD_CAST "d");
@@ -2171,7 +2228,7 @@ void saveServiceCapabilities(char *filename, struct OnvifData *onvif_data) {
     }
 }
 
-int getXmlValue(xmlDocPtr doc, xmlChar *xpath, char buf[], int buf_length) {
+int getXmlValueN(xmlDocPtr doc, xmlChar *xpath, char buf[], int buf_length, int profileIndex) {
     xmlXPathContextPtr context = xmlXPathNewContext(doc);
 
     if (!context) return -1;
@@ -2198,7 +2255,12 @@ int getXmlValue(xmlDocPtr doc, xmlChar *xpath, char buf[], int buf_length) {
         return -3;
     }
 
-    xmlChar* keyword = xmlNodeListGetString(doc, result->nodesetval->nodeTab[0]->xmlChildrenNode, 1);
+    if (profileIndex >= result->nodesetval->nodeNr) {
+        xmlXPathFreeObject(result);
+        return -5;
+    }
+
+    xmlChar* keyword = xmlNodeListGetString(doc, result->nodesetval->nodeTab[profileIndex]->xmlChildrenNode, 1);
     if (keyword) {
         memset(buf, 0, buf_length);
         strncpy(buf, (char*) keyword, buf_length);
@@ -2237,8 +2299,10 @@ int getNodeAttributen (xmlDocPtr doc, xmlChar *xpath, xmlChar *attribute, char b
     }
 
     if (result) {
-        if( profileIndex >= result->nodesetval->nodeNr )
+        if( profileIndex >= result->nodesetval->nodeNr ) {
+            xmlXPathFreeObject(result);
             return -5;
+        }
 
         keyword = xmlGetProp(result->nodesetval->nodeTab[profileIndex], attribute);
         if (keyword != NULL) {
@@ -2334,6 +2398,8 @@ xmlDocPtr sendCommandToCamera(char *cmd, char *xaddrs) {
 
     int port = atoi(port_buf);
 
+    fprintf(stderr, "send to [%s:%d]\n%s\n", host, port, cmd); 
+
 #ifdef _WIN32
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2,2), &wsaData);
@@ -2400,6 +2466,8 @@ xmlDocPtr sendCommandToCamera(char *cmd, char *xaddrs) {
     }
     http_header[xml_start] = '\0';
 
+    fprintf(stderr, "response headers from [%s:%d]\n%s\n", host, port, http_header); 
+
     substr = strstr(http_header, "Content-Length: ");
     if (substr == NULL)
         return NULL;
@@ -2434,6 +2502,8 @@ xmlDocPtr sendCommandToCamera(char *cmd, char *xaddrs) {
         cumulative_read = cumulative_read + valread;
     }
     xml_reply[xml_length] = '\0';
+
+    fprintf(stderr, "response body from [%s:%d]\n%s\n", host, port, xml_reply); 
 
 #ifdef _WIN32
     closesocket(sock);
@@ -2684,7 +2754,7 @@ void getUUID(char uuid_buf[47]) {
     }
 }
 
-int broadcast(struct OnvifSession *onvif_session) {
+int broadcast(struct OnvifSession *onvif_session, int timeout_sec) {
     strcpy(preferred_network_address, onvif_session->preferred_network_address);
     struct sockaddr_in broadcast_address;
     int broadcast_socket;
@@ -2699,12 +2769,14 @@ int broadcast(struct OnvifSession *onvif_session) {
 
     int broadcast_message_length = strlen(broadcast_message);
     broadcast_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    setSocketOptions(broadcast_socket);
+    setSocketOptions(broadcast_socket, timeout_sec);
     for (int k=0; k<128; k++) {
         for (int j=0; j<8192; j++) {
             onvif_session->buf[k][j] = '\0';
         }
     }
+
+    fprintf(stderr, "broadcasting discovery XML: %s\n", broadcast_message);
 
     memset((char *) &broadcast_address, 0, sizeof(broadcast_address));
     broadcast_address.sin_family = AF_INET;
@@ -2713,6 +2785,7 @@ int broadcast(struct OnvifSession *onvif_session) {
     int status = sendto(broadcast_socket, broadcast_message, broadcast_message_length, 0, (struct sockaddr*)&broadcast_address, sizeof(broadcast_address));
     if (status < 0) {
         //error
+        fprintf(stderr, "failed (%d) sendto broadcast discovery XML\n", status);
     }
 
     int i = 0;
@@ -2722,7 +2795,7 @@ int broadcast(struct OnvifSession *onvif_session) {
         onvif_session->len[i] = recvfrom(broadcast_socket, onvif_session->buf[i], sizeof(onvif_session->buf[i]), 0, (struct sockaddr*) &broadcast_address, &address_size);
         if (onvif_session->len[i] > 0) {
             onvif_session->buf[i][onvif_session->len[i]] = '\0';
-            //printf("session buf: %s\n", onvif_session->buf[i]);
+            fprintf(stderr, "session buf: %s\n", onvif_session->buf[i]);
             i++;
         } else {
             looping = 0;
@@ -2740,26 +2813,6 @@ int broadcast(struct OnvifSession *onvif_session) {
 
     return i;
 }
-
-#ifdef _WIN32
-DWORD GetNetworkPriority(DWORD interfaceIndex) {
-    DWORD result = -1;
-    MIB_IPINTERFACE_ROW row;
-    InitializeIpInterfaceEntry(&row);
-    row.Family = AF_INET;
-    row.InterfaceIndex = interfaceIndex;
-
-    DWORD dwRetVal = GetIpInterfaceEntry(&row);
-    if (dwRetVal == NO_ERROR) {
-        //printf("Interface Index: %d\n", row.InterfaceIndex);
-        //printf("Metric: %d\n", row.Metric);
-        result = row.Metric;
-    } else {
-        printf("GetIpInterfaceEntry failed with error: %d\n", dwRetVal);
-    }
-    return result;
-}
-#endif
 
 void getActiveNetworkInterfaces(struct OnvifSession* onvif_session)
 {
@@ -2785,25 +2838,15 @@ void getActiveNetworkInterfaces(struct OnvifSession* onvif_session)
         }
     }
 
-    DWORD highest_priority = 0xFFFFFFFF;
     if ((dwRetVal = GetAdaptersInfo(pAdapterInfo, &ulOutBufLen)) == NO_ERROR) {
         pAdapter = pAdapterInfo;
         while (pAdapter) {
             if (strcmp(pAdapter->IpAddressList.IpAddress.String, "0.0.0.0")) {
-                char interface_info[1024] = {0};
-                //sprintf(interface_info, "%s - %s", pAdapter->IpAddressList.IpAddress.String, pAdapter->Description);
-                sprintf(interface_info, "%s", pAdapter->IpAddressList.IpAddress.String);
+                char interface_info[1024];
+                sprintf(interface_info, "%s - %s", pAdapter->IpAddressList.IpAddress.String, pAdapter->Description);
                 //printf("Network interface info %s\n", interface_info);
-                //printf("Combo Index: %d\n", pAdapter->ComboIndex);
-                DWORD priority = GetNetworkPriority(pAdapter->ComboIndex);
-                //printf("Priority: %d\n", priority);
-
-                if (priority < highest_priority) {
-                    highest_priority = priority;
-                    strncpy(onvif_session->primary_network_interface, interface_info, min(strlen(interface_info), sizeof(onvif_session->primary_network_interface)));
-                }
-
-                strncpy(onvif_session->active_network_interfaces[count], interface_info, min(strlen(interface_info), 1024));
+                //args.push_back(interface_info);
+                strncpy(onvif_session->active_network_interfaces[count], interface_info, 40);
                 count += 1;
             }
             pAdapter = pAdapter->Next;
@@ -2814,9 +2857,6 @@ void getActiveNetworkInterfaces(struct OnvifSession* onvif_session)
     }
     if (pAdapterInfo)
         free(pAdapterInfo);
-
-    //printf("Primary Interface: %s\n", onvif_session->primary_network_interface);
-
 #else
     struct ifaddrs *ifaddr;
     int family, s;
@@ -2847,8 +2887,8 @@ void getActiveNetworkInterfaces(struct OnvifSession* onvif_session)
 
             if (strcmp(host, "127.0.0.1")) {
                 strcpy(onvif_session->active_network_interfaces[count], host);
-                //strcat(onvif_session->active_network_interfaces[count], " - ");
-                //strcat(onvif_session->active_network_interfaces[count], ifa->ifa_name);
+                strcat(onvif_session->active_network_interfaces[count], " - ");
+                strcat(onvif_session->active_network_interfaces[count], ifa->ifa_name);
                 count += 1;
             }
         } 
@@ -2990,10 +3030,12 @@ void prefix2mask(int prefix, char mask_buf[128]) {
     inet_ntop(AF_INET, &mask, mask_buf, 128);
 }
 
-int setSocketOptions(int socket) {
+int setSocketOptions(int socket, int timeout_sec) {
     struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 500000;
+    //tv.tv_sec = 0;
+    //tv.tv_usec = 500000;
+    tv.tv_sec = timeout_sec;
+    tv.tv_usec = 0;
     int broadcast = 500;
     char loopch = 0;
     int status = 0;
@@ -3151,31 +3193,34 @@ void extractOnvifService(char service[1024], bool post) {
 
 void extractHost(char *xaddrs, char host[128]) {
     char tmp[128] = {0};
-    char *mark = NULL;
-    
-    if (mark = strstr(xaddrs, "//")) {
-        int start = mark-xaddrs+2;
-        for (int j=0; j < strlen(xaddrs)-start; j++) {
-            if (j < 128)
-                tmp[j] = xaddrs[j+start];
+    char *mark = strstr(xaddrs, "//");
+    int start = mark-xaddrs+2;
+    int tmp_len = strlen(xaddrs);
+    int j;
+    for (j=0; j<tmp_len-start; j++) {
+        if (j < 128)
+            tmp[j] = xaddrs[j+start];
+    }
+    tmp[j] = '\0';
+
+    mark = strstr(tmp, "/");
+    int end = mark-tmp;
+    char tmp2[128] = {0};
+    for (j=0; j<end; j++) {
+        tmp2[j] = tmp[j];
+    }
+    tmp2[j] = '\0';
+
+    mark = strstr(tmp2, ":");
+    if (mark == NULL) {
+        strcpy(host, tmp2);
+    } else {
+        start = mark-tmp2;
+        for (j=0; j<start; j++) {
+            host[j] = tmp2[j];
         }
+        host[j] = '\0';
     }
-
-    if (mark = strstr(tmp, "/")) {
-        int end = mark-tmp;
-        for (int j = end; j < strlen(tmp); j++)
-            tmp[j] = '\0';
-    }
-
-    if (mark = strstr(tmp, ":")) {
-        int start = mark-tmp;
-        for (int j=mark-tmp; j<strlen(tmp); j++) {
-            tmp[j] = '\0';
-        }
-    }
-
-    memset(host, 0, sizeof(host));
-    strcpy(host, tmp);
 }
 
 void getScopeField(char *scope, char *field_name, char cleaned[1024]) {
@@ -3509,9 +3554,6 @@ void initializeSession(struct OnvifSession *onvif_session) {
             onvif_session->active_network_interfaces[i][j] = '\0';
         }
     }
-    for (int i=0; i<1024; i++) {
-        onvif_session->primary_network_interface[i] = '\0';
-    }
 #ifdef _WIN32
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2,2), &wsaData);
@@ -3610,21 +3652,50 @@ void dumpConfigAll (struct OnvifData *onvif_data) {
 
     dump_reply = true;
 
-    getNetworkInterfaces(onvif_data);
-    getNetworkDefaultGateway(onvif_data);
-    getDNS(onvif_data);
+    // these 3 either are supposed to be allowed without auth
+    // or they appear to work without auth, so do them first
     getCapabilities(onvif_data);
-    getVideoEncoderConfigurationOptions(onvif_data);
-    getVideoEncoderConfiguration(onvif_data);
-    getProfile(onvif_data);
-    getOptions(onvif_data);
-    getImagingSettings(onvif_data);
-    getFirstProfileToken(onvif_data);
     getTimeOffset(onvif_data);
-    getNTP(onvif_data);
     getHostname(onvif_data);
-    getStreamUri(onvif_data);
-    getDeviceInformation(onvif_data);
+
+    // if getNetworkInterfaces doesn't succeed, then don't bother
+    // spending time trying the rest
+    if (getNetworkInterfaces(onvif_data) == 0) { 
+        getNetworkDefaultGateway(onvif_data);
+        getDNS(onvif_data);
+        getVideoEncoderConfigurationOptions(onvif_data);
+        getVideoEncoderConfiguration(onvif_data);
+        getProfile(onvif_data);
+        getOptions(onvif_data);
+        getImagingSettings(onvif_data);
+        getNTP(onvif_data);
+        getDeviceInformation(onvif_data);
+
+        /*
+         * [jsalcedo] 2025-01-17: get ALL profiles now instead of just the first
+         */
+        struct ProfileTokenHolder profileTokenHolder = {0};
+        saveProfileTokens(onvif_data, &profileTokenHolder);
+        
+        int profileIndex = 0;
+        int targetProfileIndex = 0;
+        while (profileTokenHolder.profileToken[profileIndex][0]) {
+            /*
+             * [jsalcedo] 2025-01-17: only attempt to get the stream uri for H264 encoding. If none exist,
+             * then we'll just use the first profile
+             */
+            if (strcmp(profileTokenHolder.videoEncoding[profileIndex], "H264") == 0) {
+                targetProfileIndex = profileIndex;
+                break;
+            }
+            profileIndex++;
+        }
+
+        memcpy(onvif_data->profileToken, profileTokenHolder.profileToken[targetProfileIndex], 128);
+        fprintf(stderr, "Attempting to get stream+snapshot uri with profile %d token: %s\n", targetProfileIndex, onvif_data->profileToken);
+        getStreamUri(onvif_data);
+        getSnapshotUri(onvif_data);
+    }
 
     dump_reply = false;
 }
